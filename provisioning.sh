@@ -1,22 +1,24 @@
 #!/bin/bash
 # =============================================================================
 # Muse Character Sheet H3 — RunPod provisioning script
-# Base image: ghcr.io/ai-dock/comfyui:latest-cuda   (see README.md)
+# Base image: ghcr.io/ai-dock/comfyui:latest-cuda
 # Runs automatically at pod boot via the PROVISIONING_SCRIPT env var.
-# Style/env-var naming inspired by the existing MiniMax H3 RunPod template
-# (download_minimax_h3 / minimax_quant / civitai_token / CIVITAI_LORAS /
-# CIVITAI_CHECKPOINTS / LLM_KEY / HF_TOKEN) plus the extras this specific
-# character-sheet workflow needs on top of a plain MiniMax H3 install.
+#
+# Model sources (checked 2026-09-27):
+#   https://huggingface.co/Comfy-Org/MiniMax-H3
+#   https://huggingface.co/Kijai/MiniMax-H3-experimental
+#   https://huggingface.co/Kijai/MiniMax-H3_comfy   (LoRAs only now)
 # =============================================================================
 set -euo pipefail
-
 COMFYUI_DIR="${COMFYUI_DIR:-/opt/ComfyUI}"
 [ -d "$COMFYUI_DIR" ] || COMFYUI_DIR="/workspace/ComfyUI"
 PIP="${COMFYUI_VENV_PIP:-pip}"
 CUSTOM_NODES="$COMFYUI_DIR/custom_nodes"
 MODELS="$COMFYUI_DIR/models"
 WORKFLOWS="$COMFYUI_DIR/user/default/workflows"
-mkdir -p "$CUSTOM_NODES" "$MODELS"/{diffusion_models,loras,text_encoders,vae} "$WORKFLOWS"
+mkdir -p "$CUSTOM_NODES" \
+         "$MODELS"/{diffusion_models,loras,text_encoders,vae,model_patches,checkpoints,embeddings} \
+         "$WORKFLOWS"
 
 log() { echo -e "\n\033[1;36m[provisioning]\033[0m $*"; }
 
@@ -33,13 +35,13 @@ clone_or_pull () {
 }
 
 # -----------------------------------------------------------------------------
-# 1. Python deps this workflow's custom nodes rely on
+# 1. Python deps
 # -----------------------------------------------------------------------------
 log "Force-updating ComfyUI core (ai-dock's own AUTO_UPDATE is unreliable)"
 if [ -d "$COMFYUI_DIR/.git" ]; then
   git -C "$COMFYUI_DIR" fetch --depth 1 origin master
   git -C "$COMFYUI_DIR" reset --hard origin/master
-  log "Reinstalling ComfyUI core's own requirements.txt (new core often needs new deps)"
+  log "Reinstalling ComfyUI core's own requirements.txt"
   "$PIP" install --no-cache-dir -r "$COMFYUI_DIR/requirements.txt"
 else
   log "WARNING: $COMFYUI_DIR is not a git checkout, skipping core update"
@@ -49,7 +51,7 @@ log "Installing PyAV + psutil + huggingface-cli into ComfyUI's own venv"
 "$PIP" install --no-cache-dir av psutil "huggingface_hub[cli]"
 
 # -----------------------------------------------------------------------------
-# 2. Custom nodes required to load this workflow
+# 2. Custom nodes
 # -----------------------------------------------------------------------------
 clone_or_pull "https://github.com/muse-collective-26/Muse-CharacterSheet-H3.git"
 clone_or_pull "https://github.com/muse-collective-26/Muse-MiniMax-H3-Unified-Loader.git"
@@ -58,7 +60,6 @@ clone_or_pull "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
 clone_or_pull "https://github.com/WASasquatch/was-node-suite-comfyui.git"
 clone_or_pull "https://github.com/MohammadAboulEla/ComfyUI-iTools.git"
 
-# Optional: only pulled if the matching feature is enabled below
 if [ "${use_two_stage_sampling:-false}" = "true" ]; then
   clone_or_pull "https://github.com/jlucasmcrell/ComfyUI-H3-Multishot.git"
 fi
@@ -66,26 +67,27 @@ if [ "${use_refmod:-true}" = "true" ]; then
   clone_or_pull "https://github.com/Luisacaotica/ComfyUI-MiniMaxH3Mod.git"
 fi
 
-# comfyui_memory_cleanup (RAMCleanup / VRAMCleanup nodes) — installed via
-# ComfyUI-Manager's registry name since it isn't on a fixed public git URL
-# across all mirrors. Verify the exact repo once and hardcode it here if you
-# want it pinned instead of resolved through Manager.
 if [ ! -d "$CUSTOM_NODES/comfyui_memory_cleanup" ] && [ -x "$CUSTOM_NODES/ComfyUI-Manager/cm-cli.py" ]; then
   log "Installing comfyui_memory_cleanup via ComfyUI-Manager"
   python "$CUSTOM_NODES/ComfyUI-Manager/cm-cli.py" install comfyui_memory_cleanup || \
     log "WARNING: could not auto-install comfyui_memory_cleanup — install it by name from the Manager UI"
 fi
 
-# The example workflow ships inside the Muse-CharacterSheet-H3 repo itself
 if [ -f "$CUSTOM_NODES/Muse-CharacterSheet-H3/workflows/H3 Character Sheet.json" ]; then
   cp "$CUSTOM_NODES/Muse-CharacterSheet-H3/workflows/H3 Character Sheet.json" "$WORKFLOWS/"
 fi
 
 # -----------------------------------------------------------------------------
-# 3. Base MiniMax H3 models (mirrors the existing template's toggle/quant)
+# 3. Hugging Face helper
+#    Comfy-Org stores files under diffusion_models/, text_encoders/, vae/, loras/
+#    We download the repo-relative path then flatten into ComfyUI/models/<folder>/
 # -----------------------------------------------------------------------------
 download_minimax_h3="${download_minimax_h3:-true}"
-minimax_quant="${minimax_quant:-int8}"   # int8 | fp8 | nvfp4 | false(=bf16)
+# int8 | fp8 | w4a8 | bf16 | false
+minimax_quant="${minimax_quant:-int8}"
+download_ref2va="${download_ref2va:-true}"
+download_kijai_experimental="${download_kijai_experimental:-true}"
+download_turbo_loras="${download_turbo_loras:-true}"
 
 VENV_BIN="$(dirname "${COMFYUI_VENV_PYTHON:-/usr/bin/python3}")"
 if [ -x "$VENV_BIN/hf" ]; then
@@ -95,41 +97,148 @@ elif [ -x "$VENV_BIN/huggingface-cli" ]; then
 else
   HF_BIN="hf"
 fi
-hf_dl () { "$HF_BIN" download "$@"; }
+
+hf_login () {
+  if [ -n "${HF_TOKEN:-}" ]; then
+    huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential || true
+  fi
+}
+
+# hf_get REPO REPO_RELATIVE_PATH DEST_DIR [DEST_FILENAME]
+# Downloads one file and places ONLY the basename in DEST_DIR (no nested folders).
+hf_get () {
+  local repo="$1" rel="$2" dest="$3"
+  local dest_name="${4:-$(basename "$rel")}"
+  local target="$dest/$dest_name"
+  mkdir -p "$dest"
+  if [ -f "$target" ] && [ -s "$target" ]; then
+    log "Already present: $target"
+    return 0
+  fi
+  log "HF: $repo :: $rel  ->  $target"
+  local tmp
+  tmp="$(mktemp -d)"
+  if "$HF_BIN" download "$repo" "$rel" --local-dir "$tmp"; then
+    # hf may write tmp/$rel or tmp/$(basename)
+    if [ -f "$tmp/$rel" ]; then
+      mv "$tmp/$rel" "$target"
+    elif [ -f "$tmp/$(basename "$rel")" ]; then
+      mv "$tmp/$(basename "$rel")" "$target"
+    else
+      # last resort: first safetensors found
+      local found
+      found="$(find "$tmp" -type f -name '*.safetensors' | head -n 1 || true)"
+      if [ -n "$found" ]; then
+        mv "$found" "$target"
+      else
+        log "WARNING: downloaded $repo/$rel but could not locate the file in $tmp"
+      fi
+    fi
+  else
+    log "WARNING: HF download failed for $repo/$rel"
+  fi
+  rm -rf "$tmp"
+}
 
 if [ "$download_minimax_h3" = "true" ]; then
-  log "Downloading MiniMax H3 base models (quant: $minimax_quant)"
-  [ -n "${HF_TOKEN:-}" ] && huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential || true
+  hf_login
+  log "Downloading MiniMax H3 models (quant=$minimax_quant, ref2va=$download_ref2va, kijai_exp=$download_kijai_experimental)"
 
-  # NOTE: exact filenames differ per quant and shift as Comfy-Org/Kijai update
-  # their repos. Check the file list on the repo before a fresh deploy:
-  #   https://huggingface.co/Comfy-Org/MiniMax-H3
-  #   https://huggingface.co/Kijai/MiniMax-H3_comfy
-  #   https://huggingface.co/Kijai/MiniMax-H3-experimental
-  # Override any of these with an explicit filename via env var if the repo
-  # has moved on since this script was written.
-  DIT_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fastvideo_vsa_datafree_1300step_4step_${minimax_quant}_convrot.safetensors}"
   CLIP_FILE="${MINIMAX_CLIP_FILE:-qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors}"
-  VAE_FILE="${MINIMAX_VAE_FILE:-minimax_h3_video_vae_fp16.safetensors}"
   AUDIO_VAE_FILE="${MINIMAX_AUDIO_VAE_FILE:-minimax_h3_audio_vae_fp32.safetensors}"
-  TURBO_LORA_FILE="${MINIMAX_TURBO_LORA_FILE:-minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors}"
+  # Prefer the faster int8 convrot VAE when available; override with MINIMAX_VAE_FILE
+  VAE_FILE="${MINIMAX_VAE_FILE:-minimax_h3_video_vae_int8_convrot.safetensors}"
 
-  hf_dl Comfy-Org/MiniMax-H3 "$CLIP_FILE"      --local-dir "$MODELS/text_encoders" || true
-  hf_dl Comfy-Org/MiniMax-H3 "$VAE_FILE"       --local-dir "$MODELS/vae" || true
-  hf_dl Comfy-Org/MiniMax-H3 "$AUDIO_VAE_FILE" --local-dir "$MODELS/vae" || true
-  hf_dl Kijai/MiniMax-H3_comfy "$DIT_FILE"        --local-dir "$MODELS/diffusion_models" || true
-  hf_dl Kijai/MiniMax-H3_comfy "$TURBO_LORA_FILE" --local-dir "$MODELS/loras" || true
+  # --- text encoder + VAEs (always from Comfy-Org, official ComfyUI layout) ---
+  hf_get "Comfy-Org/MiniMax-H3" "text_encoders/${CLIP_FILE}" "$MODELS/text_encoders"
+  hf_get "Comfy-Org/MiniMax-H3" "vae/${VAE_FILE}"            "$MODELS/vae"
+  # fp16 VAE fallback if someone still points a workflow at it
+  if [ "$VAE_FILE" != "minimax_h3_video_vae_fp16.safetensors" ]; then
+    hf_get "Comfy-Org/MiniMax-H3" "vae/minimax_h3_video_vae_fp16.safetensors" "$MODELS/vae" || true
+  fi
+  hf_get "Comfy-Org/MiniMax-H3" "vae/${AUDIO_VAE_FILE}"      "$MODELS/vae"
+
+  # --- diffusion weights ---
+  case "$minimax_quant" in
+    int8)
+      FL2VA_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fl2va_pruned_int8_convrot.safetensors}"
+      REF2VA_FILE="${MINIMAX_REF2VA_FILE:-minimax_h3_ref2va_pruned_int8_convrot.safetensors}"
+      hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
+      if [ "$download_ref2va" = "true" ]; then
+        hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
+      fi
+      ;;
+    fp8)
+      FL2VA_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fl2va_pruned_fp8_scaled.safetensors}"
+      REF2VA_FILE="${MINIMAX_REF2VA_FILE:-minimax_h3_ref2va_pruned_fp8_scaled.safetensors}"
+      hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
+      if [ "$download_ref2va" = "true" ]; then
+        hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
+      fi
+      ;;
+    bf16|false)
+      FL2VA_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fl2va_pruned_bf16.safetensors}"
+      REF2VA_FILE="${MINIMAX_REF2VA_FILE:-minimax_h3_ref2va_pruned_bf16.safetensors}"
+      hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
+      if [ "$download_ref2va" = "true" ]; then
+        hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
+      fi
+      ;;
+    w4a8|experimental)
+      # Kijai experimental (flat repo root, not nested)
+      FL2VA_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fl2va_pruned_w4a8_mixed.safetensors}"
+      REF2VA_FILE="${MINIMAX_REF2VA_FILE:-minimax_h3_ref2va_pruned_w4a8_mixed.safetensors}"
+      FASTVIDEO_FILE="${MINIMAX_FASTVIDEO_FILE:-minimax_h3_fastvideo_vsa_datafree_1300step_4step_int8_convrot.safetensors}"
+      hf_get "Kijai/MiniMax-H3-experimental" "$FL2VA_FILE" "$MODELS/diffusion_models"
+      if [ "$download_ref2va" = "true" ]; then
+        hf_get "Kijai/MiniMax-H3-experimental" "$REF2VA_FILE" "$MODELS/diffusion_models"
+      fi
+      hf_get "Kijai/MiniMax-H3-experimental" "$FASTVIDEO_FILE" "$MODELS/diffusion_models"
+      hf_get "Kijai/MiniMax-H3-experimental" "minimax_h3_video_vae_int8_convrot.safetensors" "$MODELS/vae"
+      ;;
+    *)
+      log "WARNING: unknown minimax_quant='$minimax_quant' — expected int8|fp8|w4a8|bf16"
+      ;;
+  esac
+
+  # Official turbo LoRAs live under Comfy-Org/MiniMax-H3/loras/
+  if [ "$download_turbo_loras" = "true" ]; then
+    TURBO_LORA_FILE="${MINIMAX_TURBO_LORA_FILE:-minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors}"
+    hf_get "Comfy-Org/MiniMax-H3" "loras/${TURBO_LORA_FILE}" "$MODELS/loras"
+    hf_get "Comfy-Org/MiniMax-H3" "loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors" "$MODELS/loras"
+    hf_get "Comfy-Org/MiniMax-H3" "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors" "$MODELS/loras"
+  fi
+
+  # Extra Kijai experimental LoRAs / 4-step flashgen / fun controlnet
+  if [ "$download_kijai_experimental" = "true" ]; then
+    hf_get "Kijai/MiniMax-H3-experimental" \
+      "loras/minimax_h3_4step_lora_flashgen_v1.0_768p_fl2va_pruned_avg_rank_13_bf16.safetensors" \
+      "$MODELS/loras"
+    hf_get "Kijai/MiniMax-H3-experimental" \
+      "loras/MiniMax-H3-FL2VA-Acc-8Step_pruned_comfy.safetensors" \
+      "$MODELS/loras"
+    if [ "$download_ref2va" = "true" ]; then
+      hf_get "Kijai/MiniMax-H3-experimental" \
+        "loras/MiniMax-H3-Ref2VA-Acc-8Step_pruned_comfy.safetensors" \
+        "$MODELS/loras"
+    fi
+    # Fun ControlNet 2.0 (int8) — optional, skip if DOWNLOAD_CONTROLNET=false
+    if [ "${download_controlnet:-false}" = "true" ]; then
+      hf_get "Kijai/MiniMax-H3-experimental" \
+        "model_patches/minimax_h3_fun_controlnet_union_2.0_pruned_int8_convrot.safetensors" \
+        "$MODELS/model_patches"
+    fi
+  fi
 fi
 
 # -----------------------------------------------------------------------------
-# 4. Community LoRAs / checkpoints from CivitAI (MysticXXX_MMH3-V1,
-#    h3-realism-people-t2v-i2v-r2v, etc.) — put their model-VERSION ids in
-#    CIVITAI_LORAS / CIVITAI_CHECKPOINTS as a comma-separated list.
+# 4. CivitAI LoRAs / checkpoints
 # -----------------------------------------------------------------------------
 civitai_download () {
   local id="$1" dest="$2"
   local token_qs=""
   [ -n "${civitai_token:-}" ] && token_qs="?token=${civitai_token}"
+  mkdir -p "$dest"
   log "CivitAI: downloading version $id -> $dest"
   wget -q --content-disposition -P "$dest" \
     "https://civitai.com/api/download/models/${id}${token_qs}" || \
@@ -146,8 +255,7 @@ if [ -n "${CIVITAI_CHECKPOINTS:-}" ]; then
 fi
 
 # -----------------------------------------------------------------------------
-# 5. Your own RefMods (e.g. isabella_Rae1_mod) — comma-separated direct or
-#    Google Drive URLs in REFMOD_URLS. Requires ComfyUI-MiniMaxH3Mod (step 2).
+# 5. RefMods
 # -----------------------------------------------------------------------------
 if [ -n "${REFMOD_URLS:-}" ]; then
   REFMOD_DIR="$CUSTOM_NODES/ComfyUI-MiniMaxH3Mod/mods"
@@ -166,3 +274,9 @@ if [ -n "${REFMOD_URLS:-}" ]; then
 fi
 
 log "Provisioning complete."
+log "Expected layout:"
+log "  $MODELS/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
+log "  $MODELS/vae/minimax_h3_video_vae_int8_convrot.safetensors"
+log "  $MODELS/vae/minimax_h3_audio_vae_fp32.safetensors"
+log "  $MODELS/diffusion_models/<fl2va + optional ref2va>"
+log "  $MODELS/loras/<turbo / flashgen>"
