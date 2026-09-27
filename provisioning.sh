@@ -39,6 +39,8 @@ log "Force-updating ComfyUI core (ai-dock's own AUTO_UPDATE is unreliable)"
 if [ -d "$COMFYUI_DIR/.git" ]; then
   git -C "$COMFYUI_DIR" fetch --depth 1 origin master
   git -C "$COMFYUI_DIR" reset --hard origin/master
+  log "Reinstalling ComfyUI core's own requirements.txt (new core often needs new deps)"
+  "$PIP" install --no-cache-dir -r "$COMFYUI_DIR/requirements.txt"
 else
   log "WARNING: $COMFYUI_DIR is not a git checkout, skipping core update"
 fi
@@ -55,7 +57,6 @@ clone_or_pull "https://github.com/kijai/ComfyUI-KJNodes.git"
 clone_or_pull "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
 clone_or_pull "https://github.com/WASasquatch/was-node-suite-comfyui.git"
 clone_or_pull "https://github.com/MohammadAboulEla/ComfyUI-iTools.git"
-clone_or_pull "https://github.com/willmiao/ComfyUI-Lora-Manager.git"
 
 # Optional: only pulled if the matching feature is enabled below
 if [ "${use_two_stage_sampling:-false}" = "true" ]; then
@@ -86,8 +87,14 @@ fi
 download_minimax_h3="${download_minimax_h3:-true}"
 minimax_quant="${minimax_quant:-int8}"   # int8 | fp8 | nvfp4 | false(=bf16)
 
-HF_BIN="$(dirname "${COMFYUI_VENV_PYTHON:-/usr/bin/python3}")/hf"
-[ -x "$HF_BIN" ] || HF_BIN="hf"
+VENV_BIN="$(dirname "${COMFYUI_VENV_PYTHON:-/usr/bin/python3}")"
+if [ -x "$VENV_BIN/hf" ]; then
+  HF_BIN="$VENV_BIN/hf"
+elif [ -x "$VENV_BIN/huggingface-cli" ]; then
+  HF_BIN="$VENV_BIN/huggingface-cli"
+else
+  HF_BIN="hf"
+fi
 hf_dl () { "$HF_BIN" download "$@"; }
 
 if [ "$download_minimax_h3" = "true" ]; then
