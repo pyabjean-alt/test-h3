@@ -12,6 +12,7 @@ set -euo pipefail
 
 COMFYUI_DIR="${COMFYUI_DIR:-/opt/ComfyUI}"
 [ -d "$COMFYUI_DIR" ] || COMFYUI_DIR="/workspace/ComfyUI"
+PIP="${COMFYUI_VENV_PIP:-pip}"
 CUSTOM_NODES="$COMFYUI_DIR/custom_nodes"
 MODELS="$COMFYUI_DIR/models"
 WORKFLOWS="$COMFYUI_DIR/user/default/workflows"
@@ -28,14 +29,22 @@ clone_or_pull () {
     log "Cloning $(basename "$dir")"
     git clone --depth 1 "$url" "$dir"
   fi
-  [ -f "$dir/requirements.txt" ] && pip install --no-cache-dir -r "$dir/requirements.txt" || true
+  [ -f "$dir/requirements.txt" ] && "$PIP" install --no-cache-dir -r "$dir/requirements.txt" || true
 }
 
 # -----------------------------------------------------------------------------
 # 1. Python deps this workflow's custom nodes rely on
 # -----------------------------------------------------------------------------
-log "Installing PyAV + psutil + huggingface-cli"
-pip install --no-cache-dir av psutil "huggingface_hub[cli]"
+log "Force-updating ComfyUI core (ai-dock's own AUTO_UPDATE is unreliable)"
+if [ -d "$COMFYUI_DIR/.git" ]; then
+  git -C "$COMFYUI_DIR" fetch --depth 1 origin master
+  git -C "$COMFYUI_DIR" reset --hard origin/master
+else
+  log "WARNING: $COMFYUI_DIR is not a git checkout, skipping core update"
+fi
+
+log "Installing PyAV + psutil + huggingface-cli into ComfyUI's own venv"
+"$PIP" install --no-cache-dir av psutil "huggingface_hub[cli]"
 
 # -----------------------------------------------------------------------------
 # 2. Custom nodes required to load this workflow
@@ -77,7 +86,9 @@ fi
 download_minimax_h3="${download_minimax_h3:-true}"
 minimax_quant="${minimax_quant:-int8}"   # int8 | fp8 | nvfp4 | false(=bf16)
 
-hf () { huggingface-cli download "$@"; }
+HF_BIN="$(dirname "${COMFYUI_VENV_PYTHON:-/usr/bin/python3}")/hf"
+[ -x "$HF_BIN" ] || HF_BIN="hf"
+hf_dl () { "$HF_BIN" download "$@"; }
 
 if [ "$download_minimax_h3" = "true" ]; then
   log "Downloading MiniMax H3 base models (quant: $minimax_quant)"
@@ -96,11 +107,11 @@ if [ "$download_minimax_h3" = "true" ]; then
   AUDIO_VAE_FILE="${MINIMAX_AUDIO_VAE_FILE:-minimax_h3_audio_vae_fp32.safetensors}"
   TURBO_LORA_FILE="${MINIMAX_TURBO_LORA_FILE:-minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors}"
 
-  hf Comfy-Org/MiniMax-H3 "$CLIP_FILE"      --local-dir "$MODELS/text_encoders" || true
-  hf Comfy-Org/MiniMax-H3 "$VAE_FILE"       --local-dir "$MODELS/vae" || true
-  hf Comfy-Org/MiniMax-H3 "$AUDIO_VAE_FILE" --local-dir "$MODELS/vae" || true
-  hf Kijai/MiniMax-H3_comfy "$DIT_FILE"        --local-dir "$MODELS/diffusion_models" || true
-  hf Kijai/MiniMax-H3_comfy "$TURBO_LORA_FILE" --local-dir "$MODELS/loras" || true
+  hf_dl Comfy-Org/MiniMax-H3 "$CLIP_FILE"      --local-dir "$MODELS/text_encoders" || true
+  hf_dl Comfy-Org/MiniMax-H3 "$VAE_FILE"       --local-dir "$MODELS/vae" || true
+  hf_dl Comfy-Org/MiniMax-H3 "$AUDIO_VAE_FILE" --local-dir "$MODELS/vae" || true
+  hf_dl Kijai/MiniMax-H3_comfy "$DIT_FILE"        --local-dir "$MODELS/diffusion_models" || true
+  hf_dl Kijai/MiniMax-H3_comfy "$TURBO_LORA_FILE" --local-dir "$MODELS/loras" || true
 fi
 
 # -----------------------------------------------------------------------------
