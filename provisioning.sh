@@ -36,7 +36,23 @@ clone_or_pull () {
 
 # -----------------------------------------------------------------------------
 # 1. Python deps
+# Latest ComfyUI + comfy_kitchen need PyTorch >= 2.7 (list[int] custom-op schema).
+# ai-dock images often still ship torch 2.4.1+cu121, which crashes at import:
+#   ValueError: infer_schema(... stride: list[int] ...)
 # -----------------------------------------------------------------------------
+log "Checking PyTorch version in ComfyUI venv"
+PY="${COMFYUI_VENV_PYTHON:-python3}"
+TORCH_VER="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null || echo 0.0.0)"
+log "Detected torch=$TORCH_VER"
+IFS='.' read -r TMAJ TMIN TREST <<< "${TORCH_VER}.0.0"
+if [ "${TMAJ:-0}" -lt 2 ] || { [ "${TMAJ:-0}" -eq 2 ] && [ "${TMIN:-0}" -lt 7 ]; }; then
+  log "Upgrading PyTorch to >=2.7 (cu124 wheels; L40S / recent drivers are fine)"
+  "$PIP" install --upgrade --no-cache-dir \
+    torch torchvision torchaudio \
+    --index-url https://download.pytorch.org/whl/cu124 || \
+    "$PIP" install --upgrade --no-cache-dir torch torchvision torchaudio
+fi
+
 log "Force-updating ComfyUI core (ai-dock's own AUTO_UPDATE is unreliable)"
 if [ -d "$COMFYUI_DIR/.git" ]; then
   git -C "$COMFYUI_DIR" fetch --depth 1 origin master
@@ -49,6 +65,12 @@ fi
 
 log "Installing PyAV + psutil + huggingface-cli into ComfyUI's own venv"
 "$PIP" install --no-cache-dir av psutil "huggingface_hub[cli]"
+
+# Last-resort pin if kitchen still cannot import on this torch
+if ! "$PY" -c "import comfy_kitchen" >/dev/null 2>&1; then
+  log "comfy_kitchen import failed — pinning comfy_kitchen==0.2.27 as fallback"
+  "$PIP" install --no-cache-dir --force-reinstall "comfy_kitchen==0.2.27" || true
+fi
 
 # -----------------------------------------------------------------------------
 # 2. Custom nodes
