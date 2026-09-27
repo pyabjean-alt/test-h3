@@ -46,6 +46,7 @@ clone_or_pull "https://github.com/kijai/ComfyUI-KJNodes.git"
 clone_or_pull "https://github.com/Kosinkadink/ComfyUI-VideoHelperSuite.git"
 clone_or_pull "https://github.com/WASasquatch/was-node-suite-comfyui.git"
 clone_or_pull "https://github.com/MohammadAboulEla/ComfyUI-iTools.git"
+clone_or_pull "https://github.com/willmiao/ComfyUI-Lora-Manager.git"
 
 # Optional: only pulled if the matching feature is enabled below
 if [ "${use_two_stage_sampling:-false}" = "true" ]; then
