@@ -5,9 +5,13 @@
 # Runs automatically at pod boot via the PROVISIONING_SCRIPT env var.
 #
 # Model sources (checked 2026-09-27):
-#   https://huggingface.co/Comfy-Org/MiniMax-H3
-#   https://huggingface.co/Kijai/MiniMax-H3-experimental
-#   https://huggingface.co/Kijai/MiniMax-H3_comfy   (LoRAs only now)
+#   https://huggingface.co/wsxxxx/MiniMax-H3            (repackaged single-file weights for ComfyUI)
+#   https://huggingface.co/Kijai/MiniMax-H3-experimental (w4a8 / fastvideo / extra LoRAs)
+#   https://huggingface.co/MiniMaxAI/MiniMax-H3          (official, Diffusers-sharded — NOT used here)
+# Both wsxxxx/MiniMax-H3 and Kijai/MiniMax-H3-experimental carry the same
+# minimax-h3-community-license-agreement as the official repo, so they are
+# gated: set HF_TOKEN to an account that has accepted the license on
+# huggingface.co/MiniMaxAI/MiniMax-H3, or these downloads will 401/403.
 # =============================================================================
 set -euo pipefail
 COMFYUI_DIR="${COMFYUI_DIR:-/opt/ComfyUI}"
@@ -101,8 +105,9 @@ fi
 
 # -----------------------------------------------------------------------------
 # 3. Hugging Face helper
-#    Comfy-Org stores files under diffusion_models/, text_encoders/, vae/, loras/
-#    We download the repo-relative path then flatten into ComfyUI/models/<folder>/
+#    wsxxxx/MiniMax-H3 mirrors ComfyUI's own folder layout at the repo root
+#    (diffusion_models/, text_encoders/, vae/, loras/, embeddings/) — we
+#    download the repo-relative path then flatten into ComfyUI/models/<folder>/
 # -----------------------------------------------------------------------------
 download_minimax_h3="${download_minimax_h3:-true}"
 # int8 | fp8 | w4a8 | bf16 | false
@@ -110,6 +115,8 @@ minimax_quant="${minimax_quant:-int8}"
 download_ref2va="${download_ref2va:-true}"
 download_kijai_experimental="${download_kijai_experimental:-true}"
 download_turbo_loras="${download_turbo_loras:-true}"
+
+MINIMAX_REPO="${MINIMAX_REPO:-wsxxxx/MiniMax-H3}"
 
 VENV_BIN="$(dirname "${COMFYUI_VENV_PYTHON:-/usr/bin/python3}")"
 if [ -x "$VENV_BIN/hf" ]; then
@@ -122,7 +129,10 @@ fi
 
 hf_login () {
   if [ -n "${HF_TOKEN:-}" ]; then
-    huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential || true
+    "$HF_BIN" auth login --token "$HF_TOKEN" --add-to-git-credential 2>/dev/null || \
+      huggingface-cli login --token "$HF_TOKEN" --add-to-git-credential || true
+  else
+    log "WARNING: no HF_TOKEN set — wsxxxx/MiniMax-H3 and Kijai/MiniMax-H3-experimental carry MiniMax's gated community license, so downloads will likely 401 without an authenticated, license-accepted token"
   fi
 }
 
@@ -141,13 +151,11 @@ hf_get () {
   local tmp
   tmp="$(mktemp -d)"
   if "$HF_BIN" download "$repo" "$rel" --local-dir "$tmp"; then
-    # hf may write tmp/$rel or tmp/$(basename)
     if [ -f "$tmp/$rel" ]; then
       mv "$tmp/$rel" "$target"
     elif [ -f "$tmp/$(basename "$rel")" ]; then
       mv "$tmp/$(basename "$rel")" "$target"
     else
-      # last resort: first safetensors found
       local found
       found="$(find "$tmp" -type f -name '*.safetensors' | head -n 1 || true)"
       if [ -n "$found" ]; then
@@ -164,50 +172,48 @@ hf_get () {
 
 if [ "$download_minimax_h3" = "true" ]; then
   hf_login
-  log "Downloading MiniMax H3 models (quant=$minimax_quant, ref2va=$download_ref2va, kijai_exp=$download_kijai_experimental)"
+  log "Downloading MiniMax H3 models (repo=$MINIMAX_REPO, quant=$minimax_quant, ref2va=$download_ref2va, kijai_exp=$download_kijai_experimental)"
 
   CLIP_FILE="${MINIMAX_CLIP_FILE:-qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors}"
   AUDIO_VAE_FILE="${MINIMAX_AUDIO_VAE_FILE:-minimax_h3_audio_vae_fp32.safetensors}"
-  # Prefer the faster int8 convrot VAE when available; override with MINIMAX_VAE_FILE
-  VAE_FILE="${MINIMAX_VAE_FILE:-minimax_h3_video_vae_int8_convrot.safetensors}"
+  # wsxxxx only lists an fp16 video VAE at repo root (no int8_convrot variant there —
+  # that one lives in Kijai/MiniMax-H3-experimental, handled in the w4a8 case below)
+  VAE_FILE="${MINIMAX_VAE_FILE:-minimax_h3_video_vae_fp16.safetensors}"
 
-  # --- text encoder + VAEs (always from Comfy-Org, official ComfyUI layout) ---
-  hf_get "Comfy-Org/MiniMax-H3" "text_encoders/${CLIP_FILE}" "$MODELS/text_encoders"
-  hf_get "Comfy-Org/MiniMax-H3" "vae/${VAE_FILE}"            "$MODELS/vae"
-  # fp16 VAE fallback if someone still points a workflow at it
-  if [ "$VAE_FILE" != "minimax_h3_video_vae_fp16.safetensors" ]; then
-    hf_get "Comfy-Org/MiniMax-H3" "vae/minimax_h3_video_vae_fp16.safetensors" "$MODELS/vae" || true
-  fi
-  hf_get "Comfy-Org/MiniMax-H3" "vae/${AUDIO_VAE_FILE}"      "$MODELS/vae"
+  # --- text encoder + VAEs ---
+  hf_get "$MINIMAX_REPO" "text_encoders/${CLIP_FILE}" "$MODELS/text_encoders"
+  hf_get "$MINIMAX_REPO" "vae/${VAE_FILE}"            "$MODELS/vae"
+  hf_get "$MINIMAX_REPO" "vae/${AUDIO_VAE_FILE}"      "$MODELS/vae"
 
   # --- diffusion weights ---
   case "$minimax_quant" in
     int8)
       FL2VA_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fl2va_pruned_int8_convrot.safetensors}"
       REF2VA_FILE="${MINIMAX_REF2VA_FILE:-minimax_h3_ref2va_pruned_int8_convrot.safetensors}"
-      hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
+      hf_get "$MINIMAX_REPO" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
       if [ "$download_ref2va" = "true" ]; then
-        hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
+        hf_get "$MINIMAX_REPO" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
       fi
       ;;
     fp8)
       FL2VA_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fl2va_pruned_fp8_scaled.safetensors}"
       REF2VA_FILE="${MINIMAX_REF2VA_FILE:-minimax_h3_ref2va_pruned_fp8_scaled.safetensors}"
-      hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
+      hf_get "$MINIMAX_REPO" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
       if [ "$download_ref2va" = "true" ]; then
-        hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
+        hf_get "$MINIMAX_REPO" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
       fi
       ;;
     bf16|false)
       FL2VA_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fl2va_pruned_bf16.safetensors}"
       REF2VA_FILE="${MINIMAX_REF2VA_FILE:-minimax_h3_ref2va_pruned_bf16.safetensors}"
-      hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
+      hf_get "$MINIMAX_REPO" "diffusion_models/${FL2VA_FILE}"  "$MODELS/diffusion_models"
       if [ "$download_ref2va" = "true" ]; then
-        hf_get "Comfy-Org/MiniMax-H3" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
+        hf_get "$MINIMAX_REPO" "diffusion_models/${REF2VA_FILE}" "$MODELS/diffusion_models"
       fi
       ;;
     w4a8|experimental)
-      # Kijai experimental (flat repo root, not nested)
+      # Kijai experimental (flat repo root, not nested) — confirmed to also
+      # host the int8 convrot video VAE and the FastVideo 4-step DiT.
       FL2VA_FILE="${MINIMAX_DIT_FILE:-minimax_h3_fl2va_pruned_w4a8_mixed.safetensors}"
       REF2VA_FILE="${MINIMAX_REF2VA_FILE:-minimax_h3_ref2va_pruned_w4a8_mixed.safetensors}"
       FASTVIDEO_FILE="${MINIMAX_FASTVIDEO_FILE:-minimax_h3_fastvideo_vsa_datafree_1300step_4step_int8_convrot.safetensors}"
@@ -223,12 +229,12 @@ if [ "$download_minimax_h3" = "true" ]; then
       ;;
   esac
 
-  # Official turbo LoRAs live under Comfy-Org/MiniMax-H3/loras/
+  # Turbo LoRAs live under <repo>/loras/
   if [ "$download_turbo_loras" = "true" ]; then
     TURBO_LORA_FILE="${MINIMAX_TURBO_LORA_FILE:-minimax_h3_fl2v_turbo_8step_v1.0_comfyui_bf16.safetensors}"
-    hf_get "Comfy-Org/MiniMax-H3" "loras/${TURBO_LORA_FILE}" "$MODELS/loras"
-    hf_get "Comfy-Org/MiniMax-H3" "loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors" "$MODELS/loras"
-    hf_get "Comfy-Org/MiniMax-H3" "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors" "$MODELS/loras"
+    hf_get "$MINIMAX_REPO" "loras/${TURBO_LORA_FILE}" "$MODELS/loras"
+    hf_get "$MINIMAX_REPO" "loras/minimax_h3_fl2v_turbo_4step_v1.0_768p_comfyui_bf16.safetensors" "$MODELS/loras"
+    hf_get "$MINIMAX_REPO" "loras/minimax_h3_ref2v_turbo_4step_v0.1_comfyui_bf16.safetensors" "$MODELS/loras"
   fi
 
   # Extra Kijai experimental LoRAs / 4-step flashgen / fun controlnet
@@ -244,7 +250,6 @@ if [ "$download_minimax_h3" = "true" ]; then
         "loras/MiniMax-H3-Ref2VA-Acc-8Step_pruned_comfy.safetensors" \
         "$MODELS/loras"
     fi
-    # Fun ControlNet 2.0 (int8) — optional, skip if DOWNLOAD_CONTROLNET=false
     if [ "${download_controlnet:-false}" = "true" ]; then
       hf_get "Kijai/MiniMax-H3-experimental" \
         "model_patches/minimax_h3_fun_controlnet_union_2.0_pruned_int8_convrot.safetensors" \
@@ -282,7 +287,7 @@ fi
 if [ -n "${REFMOD_URLS:-}" ]; then
   REFMOD_DIR="$CUSTOM_NODES/ComfyUI-MiniMaxH3Mod/mods"
   mkdir -p "$REFMOD_DIR"
-  pip install --no-cache-dir gdown >/dev/null 2>&1 || true
+  "$PIP" install --no-cache-dir gdown >/dev/null 2>&1 || true
   IFS=',' read -ra urls <<< "$REFMOD_URLS"
   for u in "${urls[@]}"; do
     u="$(echo "$u" | xargs)"
@@ -298,7 +303,7 @@ fi
 log "Provisioning complete."
 log "Expected layout:"
 log "  $MODELS/text_encoders/qwen3vl_32b_minimax_h3_nvfp4_awq.safetensors"
-log "  $MODELS/vae/minimax_h3_video_vae_int8_convrot.safetensors"
+log "  $MODELS/vae/minimax_h3_video_vae_fp16.safetensors"
 log "  $MODELS/vae/minimax_h3_audio_vae_fp32.safetensors"
 log "  $MODELS/diffusion_models/<fl2va + optional ref2va>"
 log "  $MODELS/loras/<turbo / flashgen>"
