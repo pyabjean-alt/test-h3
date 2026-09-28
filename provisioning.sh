@@ -49,11 +49,11 @@ PY="${COMFYUI_VENV_PYTHON:-python3}"
 TORCH_VER="$("$PY" -c 'import torch; print(torch.__version__.split("+")[0])' 2>/dev/null || echo 0.0.0)"
 log "Detected torch=$TORCH_VER"
 IFS='.' read -r TMAJ TMIN TREST <<< "${TORCH_VER}.0.0"
-if [ "${TMAJ:-0}" -lt 2 ] || { [ "${TMAJ:-0}" -eq 2 ] && [ "${TMIN:-0}" -lt 7 ]; }; then
-  log "Upgrading PyTorch to >=2.7 (cu124 wheels; L40S / recent drivers are fine)"
+if [ "${TMAJ:-0}" -lt 2 ] || { [ "${TMAJ:-0}" -eq 2 ] && [ "${TMIN:-0}" -lt 9 ]; }; then
+  log "Upgrading PyTorch to >=2.9 (comfy_kitchen 0.2.35 needs it; cu128 wheels)"
   "$PIP" install --upgrade --no-cache-dir \
     torch torchvision torchaudio \
-    --index-url https://download.pytorch.org/whl/cu124 || \
+    --index-url https://download.pytorch.org/whl/cu128 || \
     "$PIP" install --upgrade --no-cache-dir torch torchvision torchaudio
 fi
 
